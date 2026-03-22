@@ -1,0 +1,23 @@
+spotify_users:
+  - user_id: "REPLACE_WITH_SPOTIFY_USER_ID_1"
+  - user_id: "REPLACE_WITH_SPOTIFY_USER_ID_2"
+  - user_id: "REPLACE_WITH_SPOTIFY_USER_ID_3"
+
+settings:
+  playlists_per_user: 10       # max playlists to fetch per user (1-50)
+  artist_batch_size: 50        # IDs per call to sp.artists()
+  rate_limit_retry_seconds: 5  # base backoff on HTTP 429
+  max_retries: 3               # max retries per API call
+
+delta:
+  catalog: "spotify_graph"     # Unity Catalog catalog name
+  schema: "bronze"             # schema within the catalog
+
+neo4j:
+  uri_secret_scope: "neo4j"
+  uri_secret_key: "uri"
+  username_secret_scope: "neo4j"
+  username_secret_key: "username"
+  password_secret_scope: "neo4j"
+  password_secret_key: "password"
+  database: "neo4j"

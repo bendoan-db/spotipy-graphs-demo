@@ -1,0 +1,494 @@
+# Spotify Graph Pipeline — Design Document
+
+## Overview
+
+This project ingests Spotify data for a configurable list of users, normalizes it into Delta Lake tables on Databricks, then loads the data into Neo4j to enable graph-based querying and visualization.
+
+**Data flow:**
+
+```
+config.yaml → Notebook 1 (Extract) → Delta Tables → Notebook 2 (Load) → Neo4j
+```
+
+**Technology stack:** Python 3.10+, Databricks Runtime 13.3 LTS+, Spotipy 2.22.1, Delta Lake, Neo4j 5.x, Neo4j Spark Connector.
+
+---
+
+## 1. Configuration
+
+### config.yaml schema
+
+```yaml
+spotify_users:
+  - user_id: "spotify_user_id_1"
+  - user_id: "spotify_user_id_2"
+  - user_id: "spotify_user_id_3"
+
+settings:
+  playlists_per_user: 10       # max playlists to fetch per user (1-50)
+  artist_batch_size: 50        # IDs per call to sp.artists()
+  rate_limit_retry_seconds: 5  # base backoff on HTTP 429
+  max_retries: 3               # max retries per API call
+
+delta:
+  catalog: "spotify_graph"     # Unity Catalog catalog name
+  schema: "bronze"             # schema within the catalog
+
+neo4j:
+  uri_secret_scope: "neo4j"
+  uri_secret_key: "uri"
+  username_secret_scope: "neo4j"
+  username_secret_key: "username"
+  password_secret_scope: "neo4j"
+  password_secret_key: "password"
+  database: "neo4j"
+```
+
+Validation: `spotify_users` must be non-empty. Each entry requires a non-empty `user_id`. Config is loaded with `yaml.safe_load()`.
+
+### graph.yaml — schema definitions
+
+Table schemas for all entity and relationship tables are declared in `graph.yaml`. This file is the single source of truth for column names, types, and nullability. It is loaded at ingestion time to construct Spark `StructType` schemas when creating DataFrames, ensuring Delta tables match the declared definitions.
+
+Each relationship table also declares a `relationship_type` field with `name`, `source`, and `target` — specifying the Neo4j edge label and the entity types it connects. This allows Notebook 2 to read `graph.yaml` and dynamically create all edges without hardcoding relationship definitions. See sections 4 and 5.4 for details.
+
+---
+
+## 2. Authentication
+
+### Spotify API
+
+Use the **Client Credentials Flow** via `SpotifyClientCredentials`. This flow accesses only public data — no user OAuth token required. Private playlists will not be visible.
+
+Credentials are stored in a Databricks secret scope:
+- Scope: `spotify`, Keys: `client_id`, `client_secret`
+
+```python
+import spotipy
+from spotipy.oauth2 import SpotifyClientCredentials
+
+client_id = dbutils.secrets.get(scope="spotify", key="client_id")
+client_secret = dbutils.secrets.get(scope="spotify", key="client_secret")
+
+sp = spotipy.Spotify(
+    auth_manager=SpotifyClientCredentials(
+        client_id=client_id,
+        client_secret=client_secret
+    ),
+    requests_timeout=10,
+    retries=3
+)
+```
+
+A Spotify app must be registered at https://developer.spotify.com/dashboard to obtain `client_id` and `client_secret`.
+
+### Neo4j
+
+Stored in a `neo4j` secret scope with keys `uri`, `username`, `password`. Referenced in Notebook 2 when configuring the Spark connector.
+
+---
+
+## 3. Data Extraction Pipeline (Notebook 1)
+
+### 3.1 Overall Flow
+
+```
+For each user_id in config:
+  1. Fetch top N playlists via sp.user_playlists(user_id, limit=N)
+  2. For each playlist, paginate through all tracks via sp.playlist_items()
+  3. Collect unique artist IDs and album IDs from tracks
+  4. Batch-fetch full artist details via sp.artists() (up to 50 per call)
+Deduplicate all entities by Spotify ID.
+Write 8 Delta tables.
+```
+
+### 3.2 Fetch Users and Playlists
+
+API call: `sp.user_playlists(user_id, limit=playlists_per_user)`
+
+From each playlist extract:
+
+| Field | Source |
+|-------|--------|
+| id | `playlist['id']` |
+| name | `playlist['name']` |
+| description | `playlist['description']` |
+| owner_id | `playlist['owner']['id']` |
+| public | `playlist['public']` |
+| collaborative | `playlist['collaborative']` |
+| snapshot_id | `playlist['snapshot_id']` |
+| image_url | `playlist['images'][0]['url']` (if present) |
+| total_tracks | `playlist['tracks']['total']` |
+
+User records are extracted from the playlist `owner` object: `id`, `display_name`, `external_urls.spotify`.
+
+If a user has fewer than N playlists, accept what is returned. If 0 playlists, log a warning and skip.
+
+### 3.3 Fetch Playlist Items (Tracks)
+
+API call: `sp.playlist_items(playlist_id, limit=100, additional_types=['track'])`
+
+Pagination:
+```python
+items = []
+results = sp.playlist_items(playlist_id, limit=100, additional_types=['track'])
+items.extend(results['items'])
+while results['next']:
+    results = sp.next(results)
+    items.extend(results['items'])
+```
+
+For each item:
+- **Skip** if `item['track'] is None` (deleted or unavailable tracks)
+- **Skip** if `item['is_local'] == True` (local files have no Spotify ID)
+
+Extract from each valid item:
+- **Track record:** `id`, `name`, `duration_ms`, `explicit`, `disc_number`, `track_number`, `popularity`, `preview_url`, `album.id` (as `album_id`), `external_urls.spotify`, `external_ids.isrc`
+- **playlist_track relationship:** `playlist_id`, `track_id`, `added_at`, `added_by.id`, `position` (enumerated index)
+- **track_artist relationship:** one `(track_id, artist_id)` per artist in `track['artists']`
+- **album_artist relationship:** one `(album_id, artist_id)` per artist in `track['album']['artists']`
+- Collect all `artist_id` values and `album_id` values into sets for batch fetching
+
+### 3.4 Batch Fetch Artist Details
+
+Simplified artist objects from tracks lack `genres`, `popularity`, `followers`, and `images`. Fetch full details:
+
+```python
+# Chunk deduplicated artist IDs into batches of 50
+for batch in chunks(artist_ids, 50):
+    results = sp.artists(batch)
+    # Extract: id, name, genres, popularity, followers.total, external_urls.spotify, images[0].url
+```
+
+### 3.5 Album Extraction
+
+The simplified album object on each track already provides all required fields (`id`, `name`, `album_type`, `release_date`, `release_date_precision`, `total_tracks`, `external_urls.spotify`, `images[0].url`). No additional API call is needed.
+
+### 3.6 Deduplication
+
+All entity sets are deduplicated by Spotify `id` using dictionaries keyed by ID during collection:
+
+```python
+tracks = {}   # track_id -> record
+artists = {}  # artist_id -> record
+albums = {}   # album_id -> record
+users = {}    # user_id -> record
+```
+
+Relationship tables are deduplicated by composite key:
+- `playlist_track`: `(playlist_id, track_id, position)`
+- `track_artist`: `(track_id, artist_id)`
+- `album_artist`: `(album_id, artist_id)`
+
+### 3.7 Writing Delta Tables
+
+Schemas are loaded from `graph.yaml` and used to construct Spark `StructType` objects. This ensures each DataFrame matches the declared column names, types, and nullability before writing:
+
+```python
+import yaml
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, BooleanType, TimestampType, ArrayType
+
+TYPE_MAP = {
+    "STRING": StringType(),
+    "INT": IntegerType(),
+    "BOOLEAN": BooleanType(),
+    "TIMESTAMP": TimestampType(),
+    "ARRAY<STRING>": ArrayType(StringType()),
+}
+
+with open("graph.yaml", "r") as f:
+    graph_config = yaml.safe_load(f)
+
+def build_schema(table_name):
+    for table in graph_config["entities"] + graph_config["relationships"]:
+        if table["name"] == table_name:
+            return StructType([
+                StructField(col["name"], TYPE_MAP[col["type"]], col["nullable"])
+                for col in table["columns"]
+            ])
+    raise ValueError(f"Table '{table_name}' not found in graph.yaml")
+
+df = spark.createDataFrame(records, schema=build_schema(table_name))
+df.write.format("delta").mode("overwrite").saveAsTable(f"{catalog}.{schema}.{table_name}")
+```
+
+Full refresh on each run (`mode("overwrite")`). Incremental merge is a future enhancement.
+
+---
+
+## 4. Delta Table Schemas
+
+All table schemas are defined in `graph.yaml` (the single source of truth). The file declares two sections:
+
+- **`entities`** — `user`, `playlist`, `track`, `artist`, `album`
+- **`relationships`** — `playlist_track`, `track_artist`, `album_artist`
+
+Each entity table entry lists its columns with `name`, `type`, and `nullable` fields. Each relationship table entry additionally includes a `relationship_type` with:
+
+- **`name`** — the Neo4j edge label (e.g., `CONTAINS`, `PERFORMED_BY`, `RELEASED_BY`)
+- **`source`** — the source entity name (must match an entity in `entities`)
+- **`target`** — the target entity name (must match an entity in `entities`)
+
+At ingestion time, `graph.yaml` is parsed to build Spark `StructType` schemas (see section 3.7). The `relationship_type` metadata is used by Notebook 2 to dynamically configure Neo4j edge writes (see section 5.4).
+
+Refer to `graph.yaml` for the complete column-level definitions.
+
+---
+
+## 5. Neo4j Ingestion Pipeline (Notebook 2)
+
+### 5.1 Connection Setup
+
+```python
+neo4j_uri = dbutils.secrets.get(scope="neo4j", key="uri")
+neo4j_user = dbutils.secrets.get(scope="neo4j", key="username")
+neo4j_password = dbutils.secrets.get(scope="neo4j", key="password")
+
+neo4j_options = {
+    "url": neo4j_uri,
+    "authentication.basic.username": neo4j_user,
+    "authentication.basic.password": neo4j_password,
+    "database": "neo4j",
+}
+```
+
+### 5.2 Uniqueness Constraints
+
+Create these before loading nodes. Run via the `neo4j` Python driver or a setup cell:
+
+```cypher
+CREATE CONSTRAINT user_id IF NOT EXISTS FOR (u:User) REQUIRE u.id IS UNIQUE;
+CREATE CONSTRAINT playlist_id IF NOT EXISTS FOR (p:Playlist) REQUIRE p.id IS UNIQUE;
+CREATE CONSTRAINT track_id IF NOT EXISTS FOR (t:Track) REQUIRE t.id IS UNIQUE;
+CREATE CONSTRAINT artist_id IF NOT EXISTS FOR (a:Artist) REQUIRE a.id IS UNIQUE;
+CREATE CONSTRAINT album_id IF NOT EXISTS FOR (al:Album) REQUIRE al.id IS UNIQUE;
+```
+
+These constraints enable performant MERGE operations used by the Spark connector in Overwrite mode.
+
+### 5.3 Node Ingestion
+
+Load nodes before edges. For each entity table:
+
+```python
+user_df = spark.read.table(f"{catalog}.{schema}.user")
+user_df.write.format("org.neo4j.spark.DataSource") \
+    .mode("Overwrite") \
+    .option("labels", ":User") \
+    .option("node.keys", "id") \
+    .options(**neo4j_options) \
+    .save()
+```
+
+Repeat for `:Playlist`, `:Track`, `:Artist`, `:Album` with their respective tables. The `genres` ARRAY column on Artist is written as a native Neo4j list property.
+
+### 5.4 Edge Ingestion
+
+Edge definitions are read from the `relationship_type` field in `graph.yaml`, allowing dynamic creation of all relationship-table-backed edges:
+
+```python
+for rel in graph_config["relationships"]:
+    rel_type = rel["relationship_type"]
+    source_entity = rel_type["source"]   # e.g., "playlist"
+    target_entity = rel_type["target"]   # e.g., "track"
+    edge_label = rel_type["name"]        # e.g., "CONTAINS"
+
+    source_key = f"{source_entity}_id"   # e.g., "playlist_id"
+    target_key = f"{target_entity}_id"   # e.g., "track_id"
+
+    # All non-key columns become edge properties
+    edge_prop_cols = [
+        c["name"] for c in rel["columns"]
+        if c["name"] not in (source_key, target_key)
+    ]
+
+    rel_df = spark.read.table(f"{catalog}.{schema}.{rel['name']}") \
+        .select(
+            col(source_key).alias("source.id"),
+            col(target_key).alias("target.id"),
+            *[col(c) for c in edge_prop_cols]
+        )
+
+    rel_df.write.format("org.neo4j.spark.DataSource") \
+        .mode("Overwrite") \
+        .option("relationship", edge_label) \
+        .option("relationship.save.strategy", "keys") \
+        .option("relationship.source.labels", f":{source_entity.capitalize()}") \
+        .option("relationship.source.node.keys", "source.id:id") \
+        .option("relationship.target.labels", f":{target_entity.capitalize()}") \
+        .option("relationship.target.node.keys", "target.id:id") \
+        .options(**neo4j_options) \
+        .save()
+```
+
+This loop handles **CONTAINS**, **PERFORMED_BY**, and **RELEASED_BY** from the relationship tables.
+
+The remaining edges are derived from foreign keys on entity tables and written separately:
+
+**OWNS** (User → Playlist) — from `playlist.owner_id`:
+
+```python
+owns_df = spark.read.table(f"{catalog}.{schema}.playlist") \
+    .select(col("owner_id").alias("source.id"), col("id").alias("target.id"))
+
+owns_df.write.format("org.neo4j.spark.DataSource") \
+    .mode("Overwrite") \
+    .option("relationship", "OWNS") \
+    .option("relationship.save.strategy", "keys") \
+    .option("relationship.source.labels", ":User") \
+    .option("relationship.source.node.keys", "source.id:id") \
+    .option("relationship.target.labels", ":Playlist") \
+    .option("relationship.target.node.keys", "target.id:id") \
+    .options(**neo4j_options) \
+    .save()
+```
+
+**BELONGS_TO** (Track → Album) — from `track.album_id`:
+
+```python
+belongs_df = spark.read.table(f"{catalog}.{schema}.track") \
+    .select(col("id").alias("source.id"), col("album_id").alias("target.id"))
+
+belongs_df.write.format("org.neo4j.spark.DataSource") \
+    .mode("Overwrite") \
+    .option("relationship", "BELONGS_TO") \
+    .option("relationship.save.strategy", "keys") \
+    .option("relationship.source.labels", ":Track") \
+    .option("relationship.source.node.keys", "source.id:id") \
+    .option("relationship.target.labels", ":Album") \
+    .option("relationship.target.node.keys", "target.id:id") \
+    .options(**neo4j_options) \
+    .save()
+```
+
+---
+
+## 6. Neo4j Graph Model
+
+### Vertices
+
+| Label | Properties |
+|-------|-----------|
+| User | id, display_name, external_url |
+| Playlist | id, name, description, public, collaborative, snapshot_id, image_url, total_tracks |
+| Track | id, name, duration_ms, explicit, disc_number, track_number, popularity, preview_url, external_url, isrc |
+| Artist | id, name, genres, popularity, followers, external_url, image_url |
+| Album | id, name, album_type, release_date, release_date_precision, total_tracks, external_url, image_url |
+
+### Edges
+
+| Edge | Source | Target | Properties |
+|------|--------|--------|-----------|
+| OWNS | User | Playlist | — |
+| CONTAINS | Playlist | Track | added_at, position |
+| PERFORMED_BY | Track | Artist | — |
+| BELONGS_TO | Track | Album | — |
+| RELEASED_BY | Album | Artist | — |
+
+### Example Cypher Queries
+
+```cypher
+-- All artists in a user's playlists, ranked by appearance count
+MATCH (u:User {id: $user_id})-[:OWNS]->(p:Playlist)-[:CONTAINS]->(t:Track)-[:PERFORMED_BY]->(a:Artist)
+RETURN a.name, count(DISTINCT t) AS track_count
+ORDER BY track_count DESC
+
+-- Artists shared across multiple users' playlists
+MATCH (u1:User)-[:OWNS]->()-[:CONTAINS]->()-[:PERFORMED_BY]->(a:Artist)
+WITH a, collect(DISTINCT u1.id) AS user_ids
+WHERE size(user_ids) > 1
+RETURN a.name, user_ids
+
+-- Shortest path between two artists through the graph
+MATCH path = shortestPath(
+  (a1:Artist {name: "Artist A"})-[*]-(a2:Artist {name: "Artist B"})
+)
+RETURN path
+```
+
+---
+
+## 7. Error Handling and Rate Limiting
+
+### Spotify API Rate Limits
+
+Spotify returns HTTP 429 with a `Retry-After` header when rate limited. Spotipy's built-in retry (configured via `retries=3`) handles most cases. For additional control:
+
+```python
+import time
+from spotipy.exceptions import SpotifyException
+
+def api_call_with_backoff(func, *args, max_retries=3, **kwargs):
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except SpotifyException as e:
+            if e.http_status == 429:
+                retry_after = int(e.headers.get("Retry-After", 5))
+                time.sleep(retry_after + 1)
+            elif e.http_status in (500, 502, 503):
+                time.sleep(2 ** attempt)
+            else:
+                raise
+    raise Exception(f"API call failed after {max_retries} retries")
+```
+
+### Error Scenarios
+
+| Scenario | Handling |
+|----------|---------|
+| User ID does not exist | `user_playlists()` returns empty items. Log warning, skip. |
+| Playlist deleted | `playlist_items()` raises 404. Catch, log, skip. |
+| Track is `None` | Locally added or removed tracks. Skip. |
+| Local files (`is_local == True`) | No Spotify ID. Skip. |
+| Artist batch partial failure | Check for `None` entries in response array. |
+| Neo4j connection timeout | Use `.option("connection.timeout", "30000")`. |
+
+### Logging
+
+Log at each stage:
+- Playlists fetched per user
+- Tracks per playlist and total
+- Unique entity counts after dedup
+- Skipped items (local files, null tracks, 404s)
+- Row counts written to each Delta table and Neo4j label/edge type
+
+### Idempotency
+
+- Notebook 1: `mode("overwrite")` on Delta tables — fully idempotent on re-run.
+- Notebook 2: `mode("Overwrite")` with Neo4j Spark Connector uses MERGE — idempotent with uniqueness constraints.
+
+---
+
+## 8. Project Structure
+
+```
+spotipy-graphs-demo/
+  APP.md                          # this document
+  config.yaml                     # user list and settings
+  graph.yaml                      # entity and relationship table schemas
+  requirements.txt                # Python dependencies
+  notebooks/
+    01_extract_spotify_data.py    # Spotipy → Delta tables
+    02_load_neo4j.py              # Delta tables → Neo4j
+```
+
+### Cluster Requirements
+
+- **Runtime:** Databricks 13.3 LTS or later
+- **PyPI libraries:** `spotipy==2.22.1`, `pyyaml`
+- **Maven:** `org.neo4j:neo4j-connector-apache-spark_2.12:5.3.1_for_spark_3`
+- **Secret scopes:** `spotify` (keys: `client_id`, `client_secret`), `neo4j` (keys: `uri`, `username`, `password`)
+
+### Scale Estimates
+
+For 10 users with 10 playlists each (~100 tracks/playlist average):
+
+| Metric | Estimate |
+|--------|----------|
+| Playlists | ~100 |
+| Track-playlist pairs | ~10,000 |
+| Unique tracks (after dedup) | ~5,000-8,000 |
+| Unique artists | ~2,000-4,000 |
+| Unique albums | ~3,000-6,000 |
+| Total API calls | ~600-1,000 |

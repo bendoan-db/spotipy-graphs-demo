@@ -1,0 +1,178 @@
+entities:
+  - name: user
+    columns:
+      - name: id
+        type: STRING
+        nullable: false
+      - name: display_name
+        type: STRING
+        nullable: true
+      - name: external_url
+        type: STRING
+        nullable: true
+
+  - name: playlist
+    columns:
+      - name: id
+        type: STRING
+        nullable: false
+      - name: name
+        type: STRING
+        nullable: false
+      - name: description
+        type: STRING
+        nullable: true
+      - name: owner_id
+        type: STRING
+        nullable: false
+      - name: public
+        type: BOOLEAN
+        nullable: true
+      - name: collaborative
+        type: BOOLEAN
+        nullable: false
+      - name: snapshot_id
+        type: STRING
+        nullable: false
+      - name: image_url
+        type: STRING
+        nullable: true
+      - name: total_tracks
+        type: INT
+        nullable: false
+
+  - name: track
+    columns:
+      - name: id
+        type: STRING
+        nullable: false
+      - name: name
+        type: STRING
+        nullable: false
+      - name: duration_ms
+        type: INT
+        nullable: false
+      - name: explicit
+        type: BOOLEAN
+        nullable: false
+      - name: disc_number
+        type: INT
+        nullable: false
+      - name: track_number
+        type: INT
+        nullable: false
+      - name: popularity
+        type: INT
+        nullable: true
+      - name: preview_url
+        type: STRING
+        nullable: true
+      - name: album_id
+        type: STRING
+        nullable: false
+      - name: external_url
+        type: STRING
+        nullable: false
+      - name: isrc
+        type: STRING
+        nullable: true
+
+  - name: artist
+    columns:
+      - name: id
+        type: STRING
+        nullable: false
+      - name: name
+        type: STRING
+        nullable: false
+      - name: genres
+        type: "ARRAY<STRING>"
+        nullable: false
+      - name: popularity
+        type: INT
+        nullable: true
+      - name: followers
+        type: INT
+        nullable: true
+      - name: external_url
+        type: STRING
+        nullable: false
+      - name: image_url
+        type: STRING
+        nullable: true
+
+  - name: album
+    columns:
+      - name: id
+        type: STRING
+        nullable: false
+      - name: name
+        type: STRING
+        nullable: false
+      - name: album_type
+        type: STRING
+        nullable: false
+      - name: release_date
+        type: STRING
+        nullable: false
+      - name: release_date_precision
+        type: STRING
+        nullable: false
+      - name: total_tracks
+        type: INT
+        nullable: false
+      - name: external_url
+        type: STRING
+        nullable: false
+      - name: image_url
+        type: STRING
+        nullable: true
+
+relationships:
+  - name: playlist_track
+    relationship_type:
+      name: CONTAINS
+      source: playlist
+      target: track
+    columns:
+      - name: playlist_id
+        type: STRING
+        nullable: false
+      - name: track_id
+        type: STRING
+        nullable: false
+      - name: added_at
+        type: TIMESTAMP
+        nullable: true
+      - name: added_by_user_id
+        type: STRING
+        nullable: true
+      - name: position
+        type: INT
+        nullable: false
+
+  - name: track_artist
+    relationship_type:
+      name: PERFORMED_BY
+      source: track
+      target: artist
+    columns:
+      - name: track_id
+        type: STRING
+        nullable: false
+      - name: artist_id
+        type: STRING
+        nullable: false
+
+  - name: album_artist
+    relationship_type:
+      name: RELEASED_BY
+      source: album
+      target: artist
+    columns:
+      - name: album_id
+        type: STRING
+        nullable: false
+      - name: artist_id
+        type: STRING
+        nullable: false
