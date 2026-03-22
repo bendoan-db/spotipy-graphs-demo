@@ -1,19 +1,23 @@
 # Databricks notebook source
 
 # MAGIC %md
-# MAGIC # Spotify Data Extraction
+# MAGIC # Spotify Data Extraction (CSV-based)
 # MAGIC
-# MAGIC Extracts playlist, track, artist, album, and user data from the Spotify API
-# MAGIC and writes it to Delta tables in Unity Catalog.
+# MAGIC Reads exported Spotify playlist CSVs from the `data/` directory, normalizes
+# MAGIC them into entity and relationship tables per `graph.yaml`, and writes
+# MAGIC Delta tables to Unity Catalog.
+# MAGIC
+# MAGIC **Data layout:** Each subdirectory under `data/` is a user. Each CSV in
+# MAGIC that subdirectory is a playlist. Add more users by creating new subdirectories.
 # MAGIC
 # MAGIC **Prerequisites:**
-# MAGIC - Databricks secret scope `spotify` with keys `client_id` and `client_secret`
-# MAGIC - A Spotify app registered at https://developer.spotify.com/dashboard
-# MAGIC - Cluster libraries: `spotipy`, `pyyaml` (installed below)
+# MAGIC - Exported playlist CSVs in `data/<username>/`
+# MAGIC - `config.yaml` with `delta` catalog/schema settings
+# MAGIC - `graph.yaml` with table schema definitions
 
 # COMMAND ----------
 
-# MAGIC %pip install -r ../requirements.txt
+# MAGIC %pip install pyyaml
 # MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------
@@ -25,90 +29,49 @@
 
 import yaml
 import os
+import csv
+import hashlib
+import base64
+from datetime import datetime
 
-# Load config.yaml from the repo root (assumes notebook is run from the repo workspace)
-config_path = os.path.join(os.path.dirname(dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get().replace("/Workspace", "/Workspace")), "..", "config.yaml")
+# Load config.yaml
+nb_path = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
+if not nb_path.startswith("/Workspace"):
+    nb_path = "/Workspace" + nb_path
+config_path = os.path.join(os.path.dirname(nb_path), "..", "config.yaml")
 
-# Fallback: try common locations
 for candidate in [config_path, "/Workspace/Repos/config.yaml", "config.yaml"]:
     try:
         with open(candidate, "r") as f:
             config = yaml.safe_load(f)
+        config_dir = os.path.dirname(candidate)
         print(f"Loaded config from: {candidate}")
         break
     except FileNotFoundError:
         continue
 else:
-    raise FileNotFoundError(
-        "config.yaml not found. Ensure it is in the repo root or set the path manually."
-    )
+    raise FileNotFoundError("config.yaml not found.")
 
-# Validate required fields
-spotify_users = config.get("spotify_users", [])
-if not spotify_users:
-    raise ValueError("config.yaml: 'spotify_users' must be a non-empty list")
-
-for entry in spotify_users:
-    if not entry.get("user_id"):
-        raise ValueError("config.yaml: each entry in 'spotify_users' must have a non-empty 'user_id'")
-
-settings = config.get("settings", {})
 delta_config = config.get("delta", {})
-neo4j_config = config.get("neo4j", {})
-
-playlists_per_user = settings.get("playlists_per_user", 10)
-artist_batch_size = settings.get("artist_batch_size", 50)
-max_retries = settings.get("max_retries", 3)
-
 catalog = delta_config.get("catalog", "spotify_graph")
 schema = delta_config.get("schema", "bronze")
 
-user_ids = [entry["user_id"] for entry in spotify_users]
-print(f"Configured users: {user_ids}")
-print(f"Playlists per user: {playlists_per_user}")
+# Locate data directory
+data_dir = os.path.join(config_dir, "data")
+if not os.path.isdir(data_dir):
+    raise FileNotFoundError(f"Data directory not found: {data_dir}")
+
+user_dirs = sorted([
+    d for d in os.listdir(data_dir)
+    if os.path.isdir(os.path.join(data_dir, d)) and not d.startswith(".")
+])
+
+if not user_dirs:
+    raise ValueError(f"No user subdirectories found in {data_dir}")
+
 print(f"Delta target: {catalog}.{schema}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Initialize Spotify Client
-
-# COMMAND ----------
-
-import spotipy
-from spotipy.oauth2 import SpotifyClientCredentials
-
-client_id = dbutils.secrets.get(scope="spotify", key="client_id")
-client_secret = dbutils.secrets.get(scope="spotify", key="client_secret")
-
-sp = spotipy.Spotify(
-    auth_manager=SpotifyClientCredentials(
-        client_id=client_id,
-        client_secret=client_secret,
-    ),
-    requests_timeout=10,
-    retries=max_retries,
-)
-
-print("Spotify client initialized successfully.")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Validate Connection
-# MAGIC
-# MAGIC Quick check: fetch playlists for the first configured user to confirm auth works.
-
-# COMMAND ----------
-
-test_user_id = user_ids[0]
-test_results = sp.user_playlists(test_user_id, limit=5)
-test_count = len(test_results.get("items", []))
-print(f"Auth check passed. Found {test_count} playlists for user '{test_user_id}'.")
-
-if test_count == 0:
-    print(f"WARNING: User '{test_user_id}' has no public playlists. "
-          "Verify the user ID is correct and playlists are public.")
+print(f"Data directory: {data_dir}")
+print(f"Users found: {user_dirs}")
 
 # COMMAND ----------
 
@@ -127,9 +90,8 @@ TYPE_MAP = {
     "ARRAY<STRING>": ArrayType(StringType()),
 }
 
-# Load graph.yaml from the same directory as config.yaml
 graph_candidates = [
-    os.path.join(os.path.dirname(config_path), "graph.yaml"),
+    os.path.join(config_dir, "graph.yaml"),
     "/Workspace/Repos/graph.yaml",
     "graph.yaml",
 ]
@@ -154,214 +116,223 @@ def build_schema(table_name):
             ])
     raise ValueError(f"Table '{table_name}' not found in graph.yaml")
 
-print("Graph schemas loaded for:", [t["name"] for t in graph_config["entities"] + graph_config["relationships"]])
+
+print("Schemas loaded:", [t["name"] for t in graph_config["entities"] + graph_config["relationships"]])
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Extract Data from Spotify API
+# MAGIC ## Extract Data from CSVs
 
 # COMMAND ----------
 
-import time
-from spotipy.exceptions import SpotifyException
-from datetime import datetime
+
+def make_id(*parts):
+    """Generate a deterministic short ID by hashing the input parts."""
+    raw = "|".join(str(p).strip().lower() for p in parts)
+    digest = hashlib.sha256(raw.encode("utf-8")).digest()
+    return base64.urlsafe_b64encode(digest)[:22].decode("ascii")
 
 
-def api_call_with_backoff(func, *args, **kwargs):
-    """Wrap a Spotipy call with retry logic for rate limits and server errors."""
-    for attempt in range(max_retries):
-        try:
-            return func(*args, **kwargs)
-        except SpotifyException as e:
-            if e.http_status == 429:
-                retry_after = int(e.headers.get("Retry-After", 5))
-                print(f"  Rate limited. Retrying in {retry_after + 1}s...")
-                time.sleep(retry_after + 1)
-            elif e.http_status in (500, 502, 503):
-                time.sleep(2 ** attempt)
-            else:
-                raise
-    raise Exception(f"API call failed after {max_retries} retries")
+def parse_track_uri(uri):
+    """Extract track ID from a Spotify URI like 'spotify:track:XXXXX'."""
+    if uri and uri.startswith("spotify:track:"):
+        return uri.split(":")[-1]
+    return None
+
+
+def parse_timestamp(ts_str):
+    """Parse ISO 8601 timestamp string to datetime, or return None."""
+    if not ts_str:
+        return None
+    try:
+        return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+
+
+def infer_date_precision(date_str):
+    """Infer release_date_precision from the date string format."""
+    if not date_str:
+        return "year"
+    parts = str(date_str).split("-")
+    if len(parts) >= 3:
+        return "day"
+    elif len(parts) == 2:
+        return "month"
+    return "year"
 
 
 # Dedup dictionaries for entities
 users = {}
 playlists = {}
 tracks = {}
-artists_stub = {}  # simplified artist data from tracks (id -> record)
 albums = {}
+artists = {}
 
-# Dedup sets for relationship tables
+# Dedup structures for relationship tables
 playlist_tracks = {}   # (playlist_id, track_id, position) -> record
 track_artists = set()  # (track_id, artist_id)
 album_artists = set()  # (album_id, artist_id)
 
-# Collect artist IDs for batch enrichment
-artist_ids_to_fetch = set()
+for user_dir_name in user_dirs:
+    user_id = user_dir_name
+    user_path = os.path.join(data_dir, user_dir_name)
 
-for uid in user_ids:
-    print(f"\nProcessing user: {uid}")
+    # Register user
+    if user_id not in users:
+        users[user_id] = {
+            "id": user_id,
+            "display_name": user_dir_name.replace("_", " "),
+            "external_url": None,
+        }
 
-    # --- Fetch playlists ---
-    result = api_call_with_backoff(sp.user_playlists, uid, limit=playlists_per_user)
-    user_playlists = result.get("items", [])
+    csv_files = sorted([
+        f for f in os.listdir(user_path)
+        if f.lower().endswith(".csv")
+    ])
 
-    if not user_playlists:
-        print(f"  WARNING: No public playlists found for user '{uid}'. Skipping.")
-        continue
+    print(f"\nProcessing user: {user_id} ({len(csv_files)} playlists)")
 
-    print(f"  Found {len(user_playlists)} playlists")
+    for csv_file in csv_files:
+        playlist_name = os.path.splitext(csv_file)[0]
+        # Clean up common export artifacts in filenames
+        playlist_name = playlist_name.replace("_", " ").strip()
+        # Remove trailing " (1)" style suffixes from duplicate exports
+        if playlist_name.endswith(")") and " (" in playlist_name:
+            base = playlist_name[:playlist_name.rfind(" (")]
+            playlist_name = base
 
-    for pl in user_playlists:
-        # Extract user record from playlist owner
-        owner = pl["owner"]
-        if owner["id"] not in users:
-            users[owner["id"]] = {
-                "id": owner["id"],
-                "display_name": owner.get("display_name"),
-                "external_url": owner.get("external_urls", {}).get("spotify"),
+        playlist_id = make_id(user_id, csv_file)
+        csv_path = os.path.join(user_path, csv_file)
+
+        # Read CSV
+        with open(csv_path, "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+
+        # Register playlist
+        if playlist_id not in playlists:
+            playlists[playlist_id] = {
+                "id": playlist_id,
+                "name": playlist_name,
+                "description": None,
+                "owner_id": user_id,
+                "public": None,
+                "collaborative": False,
+                "snapshot_id": "",
+                "image_url": None,
+                "total_tracks": len(rows),
             }
 
-        # Extract playlist record
-        if pl["id"] not in playlists:
-            playlists[pl["id"]] = {
-                "id": pl["id"],
-                "name": pl["name"],
-                "description": pl.get("description"),
-                "owner_id": owner["id"],
-                "public": pl.get("public"),
-                "collaborative": pl.get("collaborative", False),
-                "snapshot_id": pl["snapshot_id"],
-                "image_url": pl["images"][0]["url"] if pl.get("images") else None,
-                "total_tracks": pl["tracks"]["total"],
-            }
+        print(f"  Playlist '{playlist_name}': {len(rows)} tracks")
 
-        # --- Fetch tracks for this playlist ---
-        try:
-            items_result = api_call_with_backoff(
-                sp.playlist_items, pl["id"], limit=100, additional_types=["track"]
-            )
-        except SpotifyException as e:
-            if e.http_status == 404:
-                print(f"  WARNING: Playlist '{pl['id']}' not found (404). Skipping.")
-                continue
-            raise
-
-        items = items_result.get("items", [])
-        while items_result.get("next"):
-            items_result = api_call_with_backoff(sp.next, items_result)
-            items.extend(items_result.get("items", []))
-
-        print(f"  Playlist '{pl['name']}': {len(items)} items")
-
-        for position, item in enumerate(items):
-            track = item.get("track")
-            if track is None:
-                continue
-            if item.get("is_local", False):
-                continue
-            if not track.get("id"):
+        for position, row in enumerate(rows):
+            # --- Track ---
+            track_id = parse_track_uri(row.get("Track URI", ""))
+            if not track_id:
                 continue
 
-            tid = track["id"]
+            track_name = row.get("Track Name", "")
+            album_name = row.get("Album Name", "")
+            artist_names_raw = row.get("Artist Name(s)", "")
+            artist_names = [a.strip() for a in artist_names_raw.split(";") if a.strip()]
+            primary_artist = artist_names[0] if artist_names else "Unknown"
 
-            # Track record
-            if tid not in tracks:
-                tracks[tid] = {
-                    "id": tid,
-                    "name": track["name"],
-                    "duration_ms": track["duration_ms"],
-                    "explicit": track.get("explicit", False),
-                    "disc_number": track.get("disc_number", 1),
-                    "track_number": track.get("track_number", 1),
-                    "popularity": track.get("popularity"),
-                    "preview_url": track.get("preview_url"),
-                    "album_id": track["album"]["id"],
-                    "external_url": track.get("external_urls", {}).get("spotify", ""),
-                    "isrc": track.get("external_ids", {}).get("isrc"),
+            # Generate deterministic album ID from album name + primary artist
+            album_id = make_id(album_name, primary_artist)
+
+            # Parse fields
+            duration_ms = int(row.get("Duration (ms)", 0) or 0)
+            popularity = int(row.get("Popularity", 0) or 0)
+            explicit_raw = row.get("Explicit", "false")
+            explicit = explicit_raw.lower() in ("true", "1", "yes")
+            release_date = str(row.get("Release Date", ""))
+            genres_raw = row.get("Genres", "")
+            genres = [g.strip() for g in genres_raw.split(";") if g.strip()] if genres_raw else []
+
+            # Register track (dedup)
+            if track_id not in tracks:
+                tracks[track_id] = {
+                    "id": track_id,
+                    "name": track_name,
+                    "duration_ms": duration_ms,
+                    "explicit": explicit,
+                    "disc_number": 1,
+                    "track_number": position + 1,
+                    "popularity": popularity,
+                    "preview_url": None,
+                    "album_id": album_id,
+                    "external_url": f"https://open.spotify.com/track/{track_id}",
+                    "isrc": None,
                 }
 
-            # playlist_track relationship
-            key = (pl["id"], tid, position)
+            # Register album (dedup)
+            if album_id not in albums:
+                albums[album_id] = {
+                    "id": album_id,
+                    "name": album_name,
+                    "album_type": "album",
+                    "release_date": release_date,
+                    "release_date_precision": infer_date_precision(release_date),
+                    "total_tracks": 0,
+                    "external_url": None,
+                    "image_url": None,
+                }
+
+            # Register artists and relationships
+            for artist_name in artist_names:
+                artist_id = make_id(artist_name)
+
+                if artist_id not in artists:
+                    artists[artist_id] = {
+                        "id": artist_id,
+                        "name": artist_name,
+                        "genres": genres,
+                        "popularity": None,
+                        "followers": None,
+                        "external_url": None,
+                        "image_url": None,
+                    }
+
+                track_artists.add((track_id, artist_id))
+
+            # Album-artist relationship (primary artist only)
+            if artist_names:
+                primary_artist_id = make_id(primary_artist)
+                album_artists.add((album_id, primary_artist_id))
+
+            # Playlist-track relationship
+            key = (playlist_id, track_id, position)
             if key not in playlist_tracks:
-                added_by = item.get("added_by", {})
+                added_by = row.get("Added By", "")
+                added_at = row.get("Added At", "")
                 playlist_tracks[key] = {
-                    "playlist_id": pl["id"],
-                    "track_id": tid,
-                    "added_at": item.get("added_at"),
-                    "added_by_user_id": added_by.get("id") if added_by else None,
+                    "playlist_id": playlist_id,
+                    "track_id": track_id,
+                    "added_at": parse_timestamp(added_at),
+                    "added_by_user_id": added_by if added_by else None,
                     "position": position,
                 }
 
-            # track_artist relationships
-            for artist in track.get("artists", []):
-                if artist.get("id"):
-                    track_artists.add((tid, artist["id"]))
-                    artist_ids_to_fetch.add(artist["id"])
+# Update album total_tracks counts
+album_track_counts = {}
+for t in tracks.values():
+    aid = t["album_id"]
+    album_track_counts[aid] = album_track_counts.get(aid, 0) + 1
+for aid, count in album_track_counts.items():
+    if aid in albums:
+        albums[aid]["total_tracks"] = count
 
-            # Album record (from simplified object on the track)
-            album = track.get("album", {})
-            aid = album.get("id")
-            if aid and aid not in albums:
-                albums[aid] = {
-                    "id": aid,
-                    "name": album["name"],
-                    "album_type": album.get("album_type", "unknown"),
-                    "release_date": album.get("release_date", ""),
-                    "release_date_precision": album.get("release_date_precision", ""),
-                    "total_tracks": album.get("total_tracks", 0),
-                    "external_url": album.get("external_urls", {}).get("spotify", ""),
-                    "image_url": album["images"][0]["url"] if album.get("images") else None,
-                }
-
-            # album_artist relationships
-            for artist in album.get("artists", []):
-                if artist.get("id") and aid:
-                    album_artists.add((aid, artist["id"]))
-                    artist_ids_to_fetch.add(artist["id"])
-
-print(f"\n--- Extraction Summary (before artist enrichment) ---")
-print(f"Users:           {len(users)}")
-print(f"Playlists:       {len(playlists)}")
-print(f"Tracks:          {len(tracks)}")
-print(f"Albums:          {len(albums)}")
-print(f"Artists to fetch: {len(artist_ids_to_fetch)}")
-print(f"playlist_track:  {len(playlist_tracks)}")
-print(f"track_artist:    {len(track_artists)}")
-print(f"album_artist:    {len(album_artists)}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Batch Fetch Artist Details
-
-# COMMAND ----------
-
-artists = {}
-artist_id_list = list(artist_ids_to_fetch)
-
-for i in range(0, len(artist_id_list), artist_batch_size):
-    batch = artist_id_list[i:i + artist_batch_size]
-    result = api_call_with_backoff(sp.artists, batch)
-
-    for artist in result.get("artists", []):
-        if artist is None:
-            continue
-        artists[artist["id"]] = {
-            "id": artist["id"],
-            "name": artist["name"],
-            "genres": artist.get("genres", []),
-            "popularity": artist.get("popularity"),
-            "followers": artist.get("followers", {}).get("total"),
-            "external_url": artist.get("external_urls", {}).get("spotify", ""),
-            "image_url": artist["images"][0]["url"] if artist.get("images") else None,
-        }
-
-    if (i // artist_batch_size + 1) % 10 == 0:
-        print(f"  Fetched {min(i + artist_batch_size, len(artist_id_list))}/{len(artist_id_list)} artists")
-
-print(f"Artists enriched: {len(artists)}")
+print(f"\n--- Extraction Summary ---")
+print(f"Users:          {len(users)}")
+print(f"Playlists:      {len(playlists)}")
+print(f"Tracks:         {len(tracks)}")
+print(f"Albums:         {len(albums)}")
+print(f"Artists:        {len(artists)}")
+print(f"playlist_track: {len(playlist_tracks)}")
+print(f"track_artist:   {len(track_artists)}")
+print(f"album_artist:   {len(album_artists)}")
 
 # COMMAND ----------
 
@@ -381,18 +352,6 @@ print(f"Ensured catalog/schema: {catalog}.{schema}")
 
 # COMMAND ----------
 
-from datetime import datetime
-
-
-def parse_timestamp(ts_str):
-    """Parse ISO 8601 timestamp string to datetime, or return None."""
-    if not ts_str:
-        return None
-    try:
-        return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-    except (ValueError, AttributeError):
-        return None
-
 
 def write_table(table_name, records):
     """Create a DataFrame with the graph.yaml schema and write as a Delta table."""
@@ -406,25 +365,14 @@ def write_table(table_name, records):
 # --- Entity tables ---
 
 write_table("user", list(users.values()))
-
 write_table("playlist", list(playlists.values()))
-
 write_table("track", list(tracks.values()))
-
 write_table("artist", list(artists.values()))
-
 write_table("album", list(albums.values()))
 
 # --- Relationship tables ---
 
-# playlist_track: convert added_at strings to datetime objects
-pt_records = []
-for rec in playlist_tracks.values():
-    pt_records.append({
-        **rec,
-        "added_at": parse_timestamp(rec["added_at"]),
-    })
-write_table("playlist_track", pt_records)
+write_table("playlist_track", list(playlist_tracks.values()))
 
 write_table("track_artist", [
     {"track_id": tid, "artist_id": aid} for tid, aid in track_artists
