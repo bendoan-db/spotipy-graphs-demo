@@ -1,0 +1,11 @@
+.databricks/
+
+# VSCode
+.vscode/
+
+# Claude
+.claude/
+
+# Python virtual environment
+venv/
+.venv/
